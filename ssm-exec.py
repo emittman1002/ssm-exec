@@ -5,9 +5,16 @@ import boto3
 
 class SsmProcessRunner():
     """
-    Runs a process on an EC2 instance via SSM
+    Executes shell scripts on an EC2 instance using SSM
     """
     def __init__(self, profile=None, tags=None, wait_interval=None, timeout_sec=None):
+        """
+        Initialize a new runner
+        :param profile: (optional) a profile to use for clients
+        :param tags: (optional) tags to use as filters when looking for instances and AMIs
+        :param wait_interval: (optional) how long to wait between polls when waiting for a command to execute
+        :param timeout_sec: (optional) how long the job will be allowed to run
+        """
         if profile:
             boto3.setup_default_session(profile_name=profile)
         self.profile = profile
@@ -24,6 +31,10 @@ class SsmProcessRunner():
         self.error_content = None
 
     def ssm_client(self):
+        """
+        Obtain a client for SSM operations
+        :return:
+        """
         if self.the_ssm_client is None:
             self.assume_role()
             if self.credentials:
@@ -38,11 +49,21 @@ class SsmProcessRunner():
         return self.the_ssm_client
 
     def ec2_client(self):
+        """
+        Obtain a client for EC2 operations
+        :return:
+        """
         if self.the_ec2_client is None:
             self.the_ec2_client = boto3.client('ec2')
         return self.the_ec2_client
 
     def assume_role(self, role_name='jenkins-agent-role'):
+        """
+        Obtain credentials that can be used to assume the
+        specified role
+        :param role_name: the name (not ARN) of the role
+        :return: None.  The credentials variable of this runner is populated
+        """
         needs_creds = self.credentials is None
         if not needs_creds:
             needs_creds = (datetime.now_utc() - self.credentials['Expiration']).total_seconds() < 5
@@ -56,6 +77,11 @@ class SsmProcessRunner():
             self.credentials = response['Credentials']
 
     def find_ec2_instance(self, **kwargs):
+        """
+        Find one or more instances
+        :param kwargs: option keyword args, possibly containing a filter
+        :return: a dict with instance info, or None if none was found
+        """
         result = self.ec2_client().describe_instances(**kwargs)
         if result and 'Reservations' in result:
             reservations = result['Reservations']
@@ -73,6 +99,15 @@ class SsmProcessRunner():
         return None
 
     def filter_by_state(self, instances, state_name, return_all=False):
+        """
+        Search a list of dicts containing instance information
+        for ones in a specified state
+        :param instances: a list of dicts containing infor about EC2 instances
+        :param state_name: the name of the state to filter on
+        :param return_all: if True return all matching instances,
+                            if False just return the first one
+        :return:
+        """
         filtered = [i for i in instances if i['State']['Name'] == state_name]
         if filtered:
             if return_all:
@@ -82,6 +117,11 @@ class SsmProcessRunner():
         return None
 
     def find_ami(self, **kwargs):
+        """
+        Find an AMI to use to start an EC2 instance
+        :param kwargs:
+        :return: info about the AMI, or None if none can be found
+        """
         result = self.ec2_client().describe_images(**kwargs)
         print(f'find_ami response: {result}')
         if 'Images' in result and result['Images']:
@@ -89,6 +129,12 @@ class SsmProcessRunner():
         return None
 
     def start_ec2_instance(self, **kwargs):
+        """
+        Start a new EC2 instance to do some work
+        :param kwargs:
+        :return: a dict with information about the new instance,
+                    or None if no instance was started
+        """
         ami = self.find_ami(**kwargs)
         if ami is not None:
             print(f"Starting a new instance using AMI {ami['ImageId']}")
@@ -105,6 +151,11 @@ class SsmProcessRunner():
         return None
 
     def restart_ec2_instance(self, instance):
+        """
+        Restarts an instance that was stopped
+        :param instance:
+        :return: a dict with info about the restarted instance
+        """
         result = self.ec2_client().start_instances(
             InstanceIds = [instance['InstanceId']]
         )
@@ -112,6 +163,11 @@ class SsmProcessRunner():
         return instance
 
     def wait_for_instance(self, instance):
+        """
+        Waits for an instance to get to a stable state
+        :param instance:
+        :return: the name of the stable state that the instance is now in
+        """
         current_state = instance['State']['Name']
         if current_state == 'pending':
             desired_state_code = 16
@@ -134,6 +190,11 @@ class SsmProcessRunner():
         return desired_state
 
     def obtain_ec2_instance(self):
+        """
+        Initializes this runner with the ID of
+        a running EC2 instance that can run commands
+        :return:
+        """
         if self.tags:
             filters = [{'Name': 'tag:' + t[0], 'Values': [t[1]]} for t in self.tags.items()]
         else:
@@ -154,10 +215,17 @@ class SsmProcessRunner():
         else:
             print(f"Unable to obtain an EC2 instance")
 
-    def run_ssm(self, command):
+    def run_ssm(self, commands):
+        """
+        Run a set of commands using an SSM managed document
+        :param commands: a single string or a list of string commands
+        :return: a response returned after commands have finished executing
+        """
         document_name = 'run-shell-script'
+        if type(commands) == str:
+            commands = [commands]
         parameters = {
-            'commands': [command],
+            'commands': commands,
             'executionTimeout': ['3600'],
         }
         if self.profile:
@@ -168,13 +236,13 @@ class SsmProcessRunner():
             DocumentName=document_name,
             Parameters=parameters
         )
-        command = response['Command']
-        print(f"Command ID: {command['CommandId']}\n  Waiting for the job to finish...", flush=True)
+        response_command = response['Command']
+        print(f"Command ID: {response_command['CommandId']}\n  Waiting for the job to finish...", flush=True)
         # Wait for the command to execute,
         # then obtain the output
-        self.wait_for_command(command)
+        self.wait_for_command(response_command)
         response = self.ssm_client().get_command_invocation(
-            CommandId=command['CommandId'],
+            CommandId=response_command['CommandId'],
             InstanceId=self.ec2_instance['InstanceId'],
             PluginName='aws:RunShellScript'
         )
@@ -188,8 +256,14 @@ class SsmProcessRunner():
             self.error_content = self.error_content.strip()
         if self.exit_code == 0 and not self.error_content:
             self.error_content = None
+        return response
 
     def wait_for_command(self, command):
+        """
+        Wait for a command to finish executing
+        :param command:
+        :return: nothing
+        """
         waiter = self.ssm_client().get_waiter('command_executed')
         if self.wait_interval:
             delay = int(self.wait_interval)
@@ -213,7 +287,12 @@ class SsmProcessRunner():
             WaiterConfig=waiter_config
         )
 
+
 def main():
+    """
+    You know what this is
+    :return:
+    """
     try:
         profile = 'sas-user'
         tags = {'sas-usage': 'true'}
@@ -233,6 +312,6 @@ def main():
     except BaseException as err:
         print(err)
 
-# Press the green button in the gutter to run the script.
+
 if __name__ == '__main__':
     main()
