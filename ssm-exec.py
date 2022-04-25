@@ -1,4 +1,5 @@
 from datetime import datetime
+from math import ceil
 
 import boto3
 
@@ -6,7 +7,7 @@ class SsmProcessRunner():
     """
     Runs a process on an EC2 instance via SSM
     """
-    def __init__(self, profile=None, tags=None):
+    def __init__(self, profile=None, tags=None, wait_interval=None, timeout_sec=None):
         if profile:
             boto3.setup_default_session(profile_name=profile)
         self.profile = profile
@@ -15,6 +16,12 @@ class SsmProcessRunner():
         self.the_ec2_client = None
         self.ec2_instance = None
         self.credentials = None
+        self.wait_interval = wait_interval
+        self.timeout_sec = timeout_sec
+        self.exit_code = None
+        self.final_status = None
+        self.output_content = None
+        self.error_content = None
 
     def ssm_client(self):
         if self.the_ssm_client is None:
@@ -148,35 +155,63 @@ class SsmProcessRunner():
             print(f"Unable to obtain an EC2 instance")
 
     def run_ssm(self, command):
-        ec2_instance_id = self.ec2_instance['InstanceId']
         document_name = 'run-shell-script'
-        user_name = self.profile if self.profile else ''
-        directory_name = f'/home/{self.profile}' if self.profile else '/'
         parameters = {
-            'commands': [f'{directory_name}/{command}'],
+            'commands': [command],
             'executionTimeout': ['3600'],
-            'workingDirectory': [directory_name]
         }
+        if self.profile:
+            parameters['workingDirectory'] = [f'/home/{self.profile}']
+
         response = self.ssm_client().send_command(
-            InstanceIds=[ec2_instance_id],
+            InstanceIds=[self.ec2_instance['InstanceId']],
             DocumentName=document_name,
             Parameters=parameters
         )
         command = response['Command']
         print(f"Command ID: {command['CommandId']}\n  Waiting for the job to finish...", flush=True)
-        waiter = self.ssm_client().get_waiter('command_executed')
-        waiter.wait(
-            CommandId=command['CommandId'],
-            InstanceId=ec2_instance_id
-        )
-        # Obtain the output
+        # Wait for the command to execute,
+        # then obtain the output
+        self.wait_for_command(command)
         response = self.ssm_client().get_command_invocation(
             CommandId=command['CommandId'],
-            InstanceId=ec2_instance_id,
+            InstanceId=self.ec2_instance['InstanceId'],
             PluginName='aws:RunShellScript'
         )
-        print(f"Response: {response}")
+        self.final_status = response['Status']
+        self.exit_code = response['ResponseCode']
+        self.output_content = response['StandardOutputContent']
+        if self.output_content:
+            self.output_content = self.output_content.strip()
+        self.error_content = response['StandardErrorContent']
+        if self.error_content:
+            self.error_content = self.error_content.strip()
+        if self.exit_code == 0 and not self.error_content:
+            self.error_content = None
 
+    def wait_for_command(self, command):
+        waiter = self.ssm_client().get_waiter('command_executed')
+        if self.wait_interval:
+            delay = int(self.wait_interval)
+            if delay <= 0:
+                delay = 1
+        else:
+            delay = 5
+        if self.timeout_sec:
+            max_attempts = int(ceil(float(self.timeout_sec) / delay))
+            if max_attempts <= 0:
+                max_attempts = 1
+        else:
+            max_attempts = 20
+        waiter_config = {
+            'Delay': delay,
+            'MaxAttempts': max_attempts
+        }
+        waiter.wait(
+            CommandId=command['CommandId'],
+            InstanceId=self.ec2_instance['InstanceId'],
+            WaiterConfig=waiter_config
+        )
 
 def main():
     try:
@@ -184,8 +219,17 @@ def main():
         tags = {'sas-usage': 'true'}
         runner = SsmProcessRunner(profile=profile, tags=tags)
         runner.obtain_ec2_instance()
-        command = 'sasjob2'
+        command = '/opt/sas/sasjob2'
         runner.run_ssm(command)
+        if runner.final_status is not None:
+            if runner.exit_code == 0:
+                print("The job succeeded")
+            else:
+                print("The job failed")
+            print(f"  Exit code: {runner.exit_code}")
+            print(f"  Output: \'{runner.output_content}\'")
+            if runner.error_content is not None:
+                print(f"  Error: \'{runner.error_content}\'")
     except BaseException as err:
         print(err)
 
