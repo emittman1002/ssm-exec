@@ -215,54 +215,66 @@ class SsmProcessRunner():
         else:
             print(f"Unable to obtain an EC2 instance")
 
-    def run_ssm(self, commands):
+    def run_ssm(self, commands, as_user=None):
         """
         Run a set of commands using an SSM managed document
         :param commands: a single string or a list of string commands
+        :param as_user: run the command as something other than root
         :return: a response returned after commands have finished executing
         """
         document_name = 'run-shell-script'
         if type(commands) == str:
             commands = [commands]
-        parameters = {
-            'commands': commands,
-            'executionTimeout': ['3600'],
-        }
-        if self.profile:
-            parameters['workingDirectory'] = [f'/home/{self.profile}']
+        if commands:
+            su_command = f'ruser -l {as_user}'
+            if as_user:
+                commands = [f"runuser -l {as_user} --session-command={c}" for c in commands]
+            parameters = {
+                'commands': commands,
+                'executionTimeout': ['3600'],
+            }
+            if self.profile:
+                parameters['workingDirectory'] = [f'/home/{self.profile}']
 
-        response = self.ssm_client().send_command(
-            InstanceIds=[self.ec2_instance['InstanceId']],
-            DocumentName=document_name,
-            Parameters=parameters
-        )
-        response_command = response['Command']
-        print(f"Command ID: {response_command['CommandId']}\n  Waiting for the job to finish...", flush=True)
-        # Wait for the command to execute,
-        # then obtain the output
-        self.wait_for_command(response_command)
-        response = self.ssm_client().get_command_invocation(
-            CommandId=response_command['CommandId'],
-            InstanceId=self.ec2_instance['InstanceId'],
-            PluginName='aws:RunShellScript'
-        )
-        self.final_status = response['Status']
-        self.exit_code = response['ResponseCode']
-        self.output_content = response['StandardOutputContent']
-        if self.output_content:
-            self.output_content = self.output_content.strip()
-        self.error_content = response['StandardErrorContent']
-        if self.error_content:
-            self.error_content = self.error_content.strip()
-        if self.exit_code == 0 and not self.error_content:
-            self.error_content = None
-        return response
+            response = self.ssm_client().send_command(
+                InstanceIds=[self.ec2_instance['InstanceId']],
+                DocumentName=document_name,
+                Parameters=parameters
+            )
+            response_command = response['Command']
+            print(f"Command ID: {response_command['CommandId']}\n  Waiting for the job to finish...", flush=True)
+            # Wait for the command to execute,
+            # then obtain the output
+            try:
+                self.wait_for_command(response_command)
+            except:
+                # We'll find out what's going on
+                # from get_command_invocation()
+                pass
+            response = self.ssm_client().get_command_invocation(
+                CommandId=response_command['CommandId'],
+                InstanceId=self.ec2_instance['InstanceId'],
+                PluginName='aws:RunShellScript'
+            )
+            self.final_status = response['Status']
+            self.exit_code = response['ResponseCode']
+            self.output_content = response['StandardOutputContent']
+            if self.output_content:
+                self.output_content = self.output_content.strip()
+            self.error_content = response['StandardErrorContent']
+            if self.error_content:
+                self.error_content = self.error_content.strip()
+            if self.exit_code == 0 and not self.error_content:
+                self.error_content = None
+            return response
+        return None
 
     def wait_for_command(self, command):
         """
         Wait for a command to finish executing
         :param command:
         :return: nothing
+        :raises: an exception if execution fails
         """
         waiter = self.ssm_client().get_waiter('command_executed')
         if self.wait_interval:
@@ -298,8 +310,8 @@ def main():
         tags = {'sas-usage': 'true'}
         runner = SsmProcessRunner(profile=profile, tags=tags)
         runner.obtain_ec2_instance()
-        command = '/opt/sas/sasjob2'
-        runner.run_ssm(command)
+        command = '/opt/sas/sasjob1'
+        runner.run_ssm(command, as_user='ssm-user')
         if runner.final_status is not None:
             if runner.exit_code == 0:
                 print("The job succeeded")
