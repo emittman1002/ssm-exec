@@ -229,9 +229,13 @@ class SsmProcessRunner():
             su_command = f'ruser -l {as_user}'
             if as_user:
                 commands = [f"runuser -l {as_user} --session-command={c}" for c in commands]
+            if self.timeout_sec:
+                execution_timeout = str(self.timeout_sec)
+            else:
+                execution_timeout = '3600'
             parameters = {
                 'commands': commands,
-                'executionTimeout': ['3600'],
+                'executionTimeout': [execution_timeout],
             }
             if self.profile:
                 parameters['workingDirectory'] = [f'/home/{self.profile}']
@@ -284,9 +288,12 @@ class SsmProcessRunner():
         else:
             delay = 5
         if self.timeout_sec:
-            max_attempts = int(ceil(float(self.timeout_sec) / delay))
+            # The timeout should come from send_command(), not from
+            # the waiter, so add some extra seconds to give it time
+            # to do that
+            max_attempts = int(ceil(float(self.timeout_sec) / delay)) + 2
             if max_attempts <= 0:
-                max_attempts = 1
+                max_attempts = 2
         else:
             max_attempts = 20
         waiter_config = {
@@ -308,9 +315,9 @@ def main():
     try:
         profile = 'sas-user'
         tags = {'sas-usage': 'true'}
-        runner = SsmProcessRunner(profile=profile, tags=tags)
+        runner = SsmProcessRunner(profile=profile, tags=tags, wait_interval=5, timeout_sec=10)
         runner.obtain_ec2_instance()
-        command = '/opt/sas/sasjob1'
+        command = '/opt/sas/sasjob2'
         runner.run_ssm(command, as_user='ssm-user')
         if runner.final_status is not None:
             if runner.exit_code == 0:
@@ -318,6 +325,7 @@ def main():
             else:
                 print("The job failed")
             print(f"  Exit code: {runner.exit_code}")
+            print(f"  Status: {runner.final_status}")
             print(f"  Output: \'{runner.output_content}\'")
             if runner.error_content is not None:
                 print(f"  Error: \'{runner.error_content}\'")
